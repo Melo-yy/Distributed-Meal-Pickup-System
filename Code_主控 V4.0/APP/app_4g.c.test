@@ -1,0 +1,29 @@
+#include "stm32f4xx.h"
+#include "app_4g.h"
+#include "debug_config.h"
+#include "event_groups.h"
+#include "task.h"
+
+QueueHandle_t xOrderProc4G_Show_Queue = NULL;
+QueueHandle_t xOrderProc4G_LED_Queue = NULL;
+QueueHandle_t xOrderProc4G_Voice_Queue = NULL;
+SystemTime_t g_SystemTime;   // 姘撹仧绡撴皳鍗よ仚蹇欒伌闇茶寘鑱撮簱姘撻鑱垫皳鑱滅瘬姘撹伀鑱佃寘鑱¤伀
+
+uint8_t http_rx_buffer[MAX_PACKET_SIZE];
+uint8_t http_info_buf[MAX_PACKET_SIZE];
+uint8_t packet_ready = 0;
+uint16_t packet_index = 0;
+uint8_t receiving = 0;
+
+uint8_t OK_4G_flag = 0;
+
+device_id_mgr_t g_device_mgr;
+PaginationState page_order_state = {0};
+/**************************************************************************
+Function: DeviceMgr_Init
+Input   : none
+Output  : none
+姘撹仭闄嗗繖鑱叉幊姘撹仱鑱肩尗鑱濋檰鑼傚綍鑱风尗搴愭埉姘撻檱鑱¤幗搴愰殕鑾借伂鑱犳皳鑱剁瘬姘撹仮鑱烘皳鎼傝仴姘撹仸鑱虫皳鑱￠檰蹇欒伈鎺宠尗鑱欒仠鑾介瞾绂勮幗绂勮伡姘撹伂鐐夋皳鑱ょ瘬蹇欒伌闇茬尗鎺宠仢鑾借伆绡撶洸璧傝仚蹇欏崲闅嗚寕褰曡仸蹇欒祩鑱熻幗婕忔綖鐚簮鎴皳闄囪仭鑾藉簮闅嗚幗鑱仩姘撹伓绡撹幗绂勮伅蹇欒伝鑱炵洸闄嗚伅
+姘撹仧妤兼皳鑱嫝姘撹伀鑱滃繖鑱叉幊鑼傚綍鑱峰繖鑱磋伣
+鐚┐鑱版皳鑱歌伝  姘撹仚褰曡寕褰曡伔闁
+iconv: APP/app_4g.c:28:38: cannot convert

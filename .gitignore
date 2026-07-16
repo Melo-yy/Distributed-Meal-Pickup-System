@@ -1,0 +1,53 @@
+﻿# ========== Keil MDK / ARMCC Build Outputs ==========
+*.o
+*.d
+*.crf
+*.dep
+*.axf
+*.htm
+*.sct
+*.lnp
+*.iex
+*.bak
+*.tra
+*.lst
+*.map
+*.scvd
+*.uvguix.*
+*.uvoptx
+*.uvproj.*.bak
+ExtDll.iex
+
+# Object / Listing directories
+*/OBJ/
+*/LST/
+OBJ/
+LST/
+
+# ========== Compiled Binaries ==========
+*.hex
+*.bin
+*.elf
+*.s19
+*.mot
+
+# ========== Claude AI config ==========
+.claude/
+
+# ========== Windows ==========
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ========== Archives ==========
+*.zip
+*.rar
+*.7z
+*.gz
+*.tar
+
+# ========== Other ==========
+*.log
+*.swp
+*.swo
+*~

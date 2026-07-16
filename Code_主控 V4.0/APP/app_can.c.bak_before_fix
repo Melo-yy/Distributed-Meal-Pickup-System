@@ -1,0 +1,1122 @@
+#include "app_can.h"
+#include "event_groups.h"
+
+
+static Slave_Status_t slave_status[9];  // 9个从机状�?
+
+//从机连接结构�?
+static host_slave_connection_t slave_connections[MAX_SLAVE_COUNT];
+static uint8_t connected_slave_count = 0;				//	实际连接从机�?
+
+// 全局队列定义
+QueueHandle_t xHostVoiceQueue = NULL;
+QueueHandle_t xHostDisplayQueue = NULL;
+QueueHandle_t xOrderRequestQueue = NULL;
+
+// 主机内存放从4G模块下载的从机ID列表
+uint16_t Slave_ID_List[20];
+uint8_t Slave_ID_Count = 0;  // 实际从机数量
+
+
+static host_order_processing_t host_order_proc = {
+    .is_processing = 0,
+    .order_id = {0},
+    .start_time = 0,
+    .timeout_checked = 0
+};
+//---------------------------------------------------------------------------------------------------------------//
+//-----------------------------------------------初始化部�?-----------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+
+/**************************************************************************
+Function: app_can_Host_InitSlaveConnections
+Input   : none
+Output  : none
+函数功能：主机端从机连接状态管理初始化。清空连接数并配置每个槽位的超时与重试参�?
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_InitSlaveConnections(void)
+{
+    connected_slave_count = 0;
+    for (int i = 0; i < MAX_SLAVE_COUNT; i++) {
+        slave_connections[i].slave_id = 0;
+        slave_connections[i].state = HOST_SLAVE_STATE_DISCONNECTED;
+        slave_connections[i].retry_count = 0;
+        slave_connections[i].last_send_time = 0;
+        slave_connections[i].last_confirm_time = 0;
+        slave_connections[i].max_retries = 3;
+        slave_connections[i].confirm_timeout = 2000;  // 2秒确认超�?
+        slave_connections[i].retry_interval = 1000;   // 1秒重试间�?
+    }
+}
+
+/**************************************************************************
+Function: Host application layer initialization
+Input   : none
+Output  : none
+函数功能：主机应用层初始�?
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_Init(void)
+{
+	
+    xHostVoiceQueue = xQueueCreate(5, sizeof(Host_response_event_t));
+    xHostDisplayQueue = xQueueCreate(5, sizeof(Host_response_event_t));
+    xOrderRequestQueue = xQueueCreate(ORDER_QUEUE_LENGTH, ORDER_QUEUE_ITEM_SIZE);
+	
+		if (xHostVoiceQueue && xHostDisplayQueue && xOrderRequestQueue) {
+        DBG_INFO("Queues initialized successfully\r\n");
+    } else {
+        DBG_ERROR("Failed to initialize queues\r\n");
+    }
+	
+	  // 初始化从机状�?
+    for (uint8_t i = 0; i < MAX_SLAVE_COUNT; i++) 
+		{
+        slave_status[i].slave_id = i + 1;
+        slave_status[i].is_online = 0;
+        slave_status[i].last_comm_time = 0;
+    }
+		
+		
+		// 初始化空的从机ID列表（等�?G模块更新�?
+		Slave_ID_Count = 0;
+    memset(Slave_ID_List, 0, sizeof(Slave_ID_List));
+		
+		app_can_Host_InitSlaveConnections();
+    DBG_INFO("CAN_HOST: Initialized (ID: 0x%03X)\r\n", HOST_ID);
+    DBG_INFO("CAN_HOST: Waiting for authorized slaves...\r\n");
+		
+}
+
+
+/**************************************************************************
+Function: Initialize slave ID list from 4G module
+Input   : id_list - array of slave IDs
+          count   - number of slaves
+Output  : none
+函数功能：从4G模块初始化从机ID列表
+入口参数：id_list - 从机ID数组
+          count   - 从机数量
+返回  值：�?
+**************************************************************************/
+void app_can_Host_InitSlaveIDList(uint16_t *id_list, uint8_t count)
+{
+    if (count > 20) {
+        count = 20;  // 限制最大数�?
+    }
+    
+    Slave_ID_Count = count;
+    memcpy(Slave_ID_List, id_list, count * sizeof(uint16_t));
+    
+    DBG_INFO("CAN_HOST: Slave ID list initialized with %d slaves: ", count);
+    for (int i = 0; i < count; i++) {
+        DBG_INFO("0x%03X ", Slave_ID_List[i]);
+    }
+    DBG_INFO("\r\n");
+}
+
+//---------------------------------------------------------------------------------------------------------------//
+//----------------------------------------------发送指定命�?----------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+
+/**************************************************************************
+Function: Send command to slave and refresh activity timestamp
+Input   : slave_id - target slave ID (1-9)
+          cmd      - command byte
+          data     - pointer to parameter bytes (NULL if none)
+          data_len - number of parameter bytes (0-7)
+Output  : can_status_t - operation result
+函数功能：向从机发送命令，并在发送成功后更新最后通信时间�?
+入口参数：slave_id - 目标从机编号(1-9)
+          cmd      - 命令�?
+          data     - 参数数据指针（无参数时填NULL�?
+          data_len - 参数长度�?-7�?
+返回  值：can_status_t 枚举�?
+          CAN_STATUS_OK        发送成功且时间戳已更新
+          CAN_STATUS_INVALID_ID 从机编号非法
+          CAN_STATUS_RESP_ERROR 参数长度>7或data为空但data_len>0
+          其余�?              来自bsp_can_Transmit的底层错�?
+**************************************************************************/
+can_status_t app_can_Host_SendCmd(uint16_t slave_id, uint8_t cmd, uint8_t *data, uint8_t data_len)
+{
+    // 参数验证
+    if (!IS_VALID_SLAVE_ID(slave_id)) {
+        return CAN_STATUS_INVALID_ID;
+    }
+    if (data_len > 7 || (data_len > 0 && data == NULL) ) {
+        return CAN_STATUS_RESP_ERROR;
+    }
+
+    // 构建发送数�?
+    uint8_t tx[8] = {cmd}; 		//�?0 字节固定�?命令�?
+    if (data_len > 0) {
+        memcpy(&tx[1], data, data_len);
+    }
+
+    // 发送并更新状�? （发送的11位标准CAN标识符StdId与接受端的ID一致，接收端置监听与本身ID一致的信息，实现指定端发送）
+    can_status_t st = bsp_can_Transmit(slave_id, data_len + 1, tx);
+		
+    if (st == CAN_STATUS_OK) {
+        slave_status[slave_id - SLAVE_ID_MIN].last_comm_time = getSysTickCnt();
+    }
+    return st;
+}
+
+
+//---------------------------------------------------------------------------------------------------------------//
+//-------------------------------------------主从机连接处�?-----------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+
+/**************************************************************************
+Function: Find slave connection by slave ID
+Input   : slave_id - target slave ID
+Output  : pointer to connection, NULL if not found
+函数功能：通过从机ID查找连接
+入口参数：slave_id - 目标从机ID
+返回  值：连接指针，未找到返回NULL
+**************************************************************************/
+host_slave_connection_t* app_can_Host_FindSlaveConnection(uint16_t slave_id)
+{
+    for (int i = 0; i < connected_slave_count; i++) {
+        if (slave_connections[i].slave_id == slave_id) {
+            return &slave_connections[i];
+        }
+    }
+    return NULL;
+}
+
+/**************************************************************************
+Function: Check if slave ID is in allowed list
+Input   : slave_id - slave ID to check
+Output  : 1 if allowed, 0 if not allowed
+函数功能：检查从机ID是否在允许列表中
+入口参数：slave_id - 要检查的从机ID
+返回  值：1-允许�?-不允�?
+**************************************************************************/
+uint8_t app_can_Host_IsSlaveAllowed(uint16_t slave_id)
+{
+    for (int i = 0; i < Slave_ID_Count; i++) {
+        if (Slave_ID_List[i] == slave_id) {
+            return 1;  // 在列表中，允许连�?
+        }
+    }
+    return 0;  // 不在列表中，拒绝连接
+}
+
+/**************************************************************************
+Function: Add new slave connection
+Input   : slave_id - new slave ID
+Output  : pointer to new connection, NULL if failed
+函数功能：添加新的从机连�?
+入口参数：slave_id - 新从机ID
+返回  值：新连接指针，失败返回NULL
+**************************************************************************/
+host_slave_connection_t* app_can_Host_AddSlaveConnection(uint16_t slave_id)
+{
+    if (connected_slave_count >= MAX_SLAVE_COUNT) {
+        DBG_ERROR("CAN_HOST: Cannot add slave 0x%03X, max slave count reached\r\n", slave_id);
+        return NULL;
+    }
+    
+    // 检查是否已存在
+    if (app_can_Host_FindSlaveConnection(slave_id) != NULL) {
+        DBG_WARN("CAN_HOST: Slave 0x%03X already exists\r\n", slave_id);
+        return NULL;
+    }
+    
+    // 添加到数�?
+    host_slave_connection_t* new_conn = &slave_connections[connected_slave_count];
+    new_conn->slave_id = slave_id;
+    new_conn->state = HOST_SLAVE_STATE_WAITING_CONFIRM;
+    new_conn->retry_count = 0;
+    new_conn->last_send_time = getSysTickCnt();
+    new_conn->last_confirm_time = 0;
+    new_conn->max_retries = 3;
+    new_conn->confirm_timeout = 2000;
+    new_conn->retry_interval = 1000;
+    
+    connected_slave_count++;
+    
+    DBG_INFO("CAN_HOST: New slave 0x%03X added, total slaves: %d\r\n", 
+           slave_id, connected_slave_count);
+    
+    return new_conn;
+}
+
+/**************************************************************************
+Function: Remove slave connection
+Input   : slave_id - slave ID to remove
+Output  : none
+函数功能：移除从机连�?
+入口参数：slave_id - 要移除的从机ID
+返回  值：�?
+**************************************************************************/
+void app_can_Host_RemoveSlaveConnection(uint16_t slave_id)
+{
+	
+    for (int i = 0; i < connected_slave_count; i++) {
+        if (slave_connections[i].slave_id == slave_id) {
+            DBG_INFO("CAN_HOST: Removing slave 0x%03X from connection list\r\n", slave_id);
+            
+            // 将最后一个元素移动到当前位置
+            if (i < connected_slave_count - 1) {
+                slave_connections[i] = slave_connections[connected_slave_count - 1];
+            }
+            
+            // 清空最后一个位�?
+            slave_connections[connected_slave_count - 1].slave_id = 0;
+            slave_connections[connected_slave_count - 1].state = HOST_SLAVE_STATE_DISCONNECTED;
+            
+            connected_slave_count--;
+            return;
+        }
+    }
+}
+
+/**************************************************************************
+Function: Host send ping response to slave
+Input   : slave_id - target slave ID
+Output  : can_status_t status
+函数功能：主机向从机发送ping响应
+入口参数：slave_id - 目标从机ID
+返回  值：can_status_t状�?
+**************************************************************************/
+can_status_t app_can_Host_SendPingResponse(uint16_t slave_id)
+{
+    if (!IS_VALID_SLAVE_ID(slave_id)) {
+        return CAN_STATUS_INVALID_ID;
+    }
+    
+    // 准备响应数据 [响应类型(1) | 主机ID高字�?1) | 主机ID低字�?1)]
+    uint8_t resp_data[3];
+    resp_data[0] = RESP_SELF_TEST;
+    resp_data[1] = (HOST_ID >> 8) & 0xFF;   // 主机ID高字�?
+    resp_data[2] = HOST_ID & 0xFF;          // 主机ID低字�?
+    
+    // 发送响应到从机
+    can_status_t status = bsp_can_Transmit(slave_id, 3, resp_data);
+    
+    if (status == CAN_STATUS_OK) {
+        DBG_INFO("CAN_HOST: Ping response sent to slave 0x%03X\r\n", slave_id);
+        
+        // 查找或创建连�?
+        host_slave_connection_t* conn = app_can_Host_FindSlaveConnection(slave_id);
+        if (conn == NULL) {
+            conn = app_can_Host_AddSlaveConnection(slave_id);
+        }
+        
+        if (conn != NULL) {
+            conn->state = HOST_SLAVE_STATE_WAITING_CONFIRM;
+            conn->last_send_time = getSysTickCnt();
+            conn->retry_count = 1;  // 第一次发�?
+        }
+    } else {
+        DBG_ERROR("CAN_HOST: Failed to send ping response to slave 0x%03X: %d\r\n", slave_id, status);
+    }
+    
+    return status;
+}
+
+/**************************************************************************
+Function: Process slave ping request
+Input   : recv_id   - received CAN ID
+          cmd_data  - command data pointer  
+          data_len  - data length
+Output  : can_status_t status
+函数功能：处理从机ping请求
+入口参数：recv_id   - 接收到的CAN ID
+          cmd_data  - 命令数据指针
+          data_len  - 数据长度
+返回  值：can_status_t状�?
+**************************************************************************/
+can_status_t app_can_Host_ProcessSlavePing(uint32_t recv_id, uint8_t *cmd_data, uint8_t data_len)
+{
+    // 验证数据长度
+    if (data_len < 3) {
+        DBG_WARN("CAN_HOST: Slave ping request too short, len=%d\r\n", data_len);
+        return CAN_STATUS_RESP_ERROR;
+    }
+    
+    // 解析从机ID
+    uint8_t slave_id_high = cmd_data[1];
+    uint8_t slave_id_low = cmd_data[2];
+    uint16_t slave_id = (slave_id_high << 8) | slave_id_low;
+    
+    if (!IS_VALID_SLAVE_ID(slave_id) && slave_id == recv_id) {
+        DBG_WARN("CAN_HOST: Invalid slave ID 0x%04X from ping request\r\n", slave_id);
+        return CAN_STATUS_INVALID_ID;
+    }
+    
+    DBG_INFO("CAN_HOST: Ping request from slave 0x%03X\r\n", slave_id);
+    
+		// 检查从机是否在从机ID白名单中
+    if (!app_can_Host_IsSlaveAllowed(slave_id)) {
+        DBG_WARN("CAN_HOST: Slave 0x%03X is not in allowed list, rejecting connection\r\n", slave_id);
+        
+        // 可选：发送拒绝连接的消息给从�?
+        uint8_t reject_data[3];
+        reject_data[0] = CMD_REFUSE_PING;  // 拒绝命令�?
+        reject_data[1] = (HOST_ID >> 8) & 0xFF;
+        reject_data[2] = HOST_ID & 0xFF;
+        bsp_can_Transmit(slave_id, 3, reject_data);
+        
+        return CAN_STATUS_INVALID_ID;
+    }
+		
+    // 发送ping响应
+    return app_can_Host_SendPingResponse(slave_id);
+}
+
+/**************************************************************************
+Function: Process slave ping success confirmation
+Input   : slave_id - slave ID that sent confirmation
+          cmd_data - command data pointer
+          data_len - data length
+Output  : can_status_t status
+函数功能：处理从机ping成功确认
+入口参数：slave_id - 发送确认的从机ID
+          cmd_data - 命令数据指针
+          data_len - 数据长度
+返回  值：can_status_t状�?
+**************************************************************************/
+can_status_t app_can_Host_ProcessPingSuccess(uint16_t slave_id, uint8_t *cmd_data, uint8_t data_len)
+{
+    // 验证数据长度
+    if (data_len < 3) {
+        DBG_WARN("CAN_HOST: Ping success confirmation too short from slave 0x%03X, len=%d\r\n", 
+               slave_id, data_len);
+        return CAN_STATUS_RESP_ERROR;
+    }
+    
+    // 解析从机ID（确认匹配）
+    uint8_t slave_id_high = cmd_data[1];
+    uint8_t slave_id_low = cmd_data[2];
+    uint16_t received_slave_id = (slave_id_high << 8) | slave_id_low;
+    
+    if (received_slave_id != slave_id) {
+        DBG_ERROR("CAN_HOST: Slave ID mismatch in ping success, expected:0x%03X, got:0x%03X\r\n", 
+               slave_id, received_slave_id);
+        return CAN_STATUS_INVALID_ID;
+    }
+    
+    // 更新连接状�?
+    host_slave_connection_t* conn = app_can_Host_FindSlaveConnection(slave_id);
+    if (conn != NULL) {
+        conn->state = HOST_SLAVE_STATE_CONNECTED;
+        conn->last_confirm_time = getSysTickCnt();
+        conn->retry_count = 0;
+        
+        DBG_INFO("CAN_HOST: Slave 0x%03X confirmed connection successfully\r\n", slave_id);
+        
+        // 打印当前连接的从机列�?
+        DBG_INFO("CAN_HOST: Current connected slaves: ");
+        for (int i = 0; i < connected_slave_count; i++) {
+            if (slave_connections[i].state == HOST_SLAVE_STATE_CONNECTED) {
+                DBG_INFO("0x%03X ", slave_connections[i].slave_id);
+            }
+        }
+        DBG_INFO("\r\n");
+    } else {
+        DBG_WARN("CAN_HOST: Received ping success from unknown slave 0x%03X\r\n", slave_id);
+        return CAN_STATUS_INVALID_ID;
+    }
+    
+    return CAN_STATUS_OK;
+}
+
+/**************************************************************************
+Function: Host slave connection timeout management
+Input   : none
+Output  : none
+函数功能：主机从机连接超时管�?
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_ConnectionTimeoutManager(void)
+{
+    uint32_t current_time = getSysTickCnt();
+    
+    for (int i = 0; i < connected_slave_count; i++) {
+        host_slave_connection_t* conn = &slave_connections[i];
+        
+        if (conn->state == HOST_SLAVE_STATE_WAITING_CONFIRM) {
+            // 检查是否超�?
+            if (current_time - conn->last_send_time > conn->confirm_timeout) {
+                if (conn->retry_count < conn->max_retries) {
+                    // 重发ping响应
+                    DBG_INFO("CAN_HOST: Confirm timeout for slave 0x%03X, retrying (%d/%d)\r\n", 
+                           conn->slave_id, conn->retry_count, conn->max_retries);
+                    
+                    // 准备响应数据
+                    uint8_t resp_data[3];
+                    resp_data[0] = RESP_SELF_TEST;
+                    resp_data[1] = (HOST_ID >> 8) & 0xFF;
+                    resp_data[2] = HOST_ID & 0xFF;
+                    
+                    // 重发
+                    if (bsp_can_Transmit(conn->slave_id, 3, resp_data) == CAN_STATUS_OK) {
+                        conn->last_send_time = getSysTickCnt();
+                        conn->retry_count++;
+                        DBG_INFO("CAN_HOST: Retry ping response sent to slave 0x%03X\r\n", conn->slave_id);
+                    } else {
+                        DBG_ERROR("CAN_HOST: Retry send failed for slave 0x%03X\r\n", conn->slave_id);
+										}
+                } else {
+                    // 超过最大重试次数，移除连接
+                    DBG_WARN("CAN_HOST: Slave 0x%03X connection failed after %d retries, removing\r\n", 
+                           conn->slave_id, conn->max_retries);
+                    app_can_Host_RemoveSlaveConnection(conn->slave_id);
+                    i--; // 因为数组被修改，需要调整索�?
+                }
+            }
+        }
+        
+        // 对于已连接的从机，可以在这里添加心跳检�?
+//        if (conn->state == HOST_SLAVE_STATE_CONNECTED) {
+//            // 可选：检查通信超时（比�?0秒无通信�?
+//            if (current_time - conn->last_confirm_time > 30000) {
+//                printf("CAN_HOST: Slave 0x%03X communication timeout, removing\r\n", conn->slave_id);
+//                app_can_Host_RemoveSlaveConnection(conn->slave_id);
+//                i--; // 因为数组被修改，需要调整索�?
+//            }
+//        }
+    }
+}
+
+/**************************************************************************
+Function: Check whether the slave is currently on-line
+Input   : slave_id - slave number (1-9)
+Output  : 1-on-line, 0-off-line
+函数功能：检查从机是否在�?
+入口参数：slave_id - 从机编号(1-9)
+返回  值：1-在线�?-离线
+**************************************************************************/
+uint8_t app_can_Host_IsSlaveOnline(uint16_t slave_id)
+{
+    if (!IS_VALID_SLAVE_ID(slave_id)) return 0;
+    
+    uint8_t index = slave_id - SLAVE_ID_MIN;
+    
+    // 检查通信超时�?0秒无通信认为离线�?
+    if (xTaskGetTickCount() - slave_status[index].last_comm_time > pdMS_TO_TICKS(10000)) {
+        slave_status[index].is_online = 0;
+    }
+    
+    return slave_status[index].is_online;
+}
+
+//---------------------------------------------------------------------------------------------------------------//
+//-----------------------------------------------解析订单ID------------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+
+/**************************************************************************
+Function: app_can_parse_order_data
+Input   : data, length, slave_id, order_buf
+Output  : bool
+函数功能：解析从机发送的订单报文。校验从�?ID 匹配性并将二进制数据转换�?ASCII 字符�?
+入口参数：data-原始数据包，
+					length-长度�?
+					slave_id-预期来源 ID�?
+					order_buf-转换后字符串缓冲
+返回  值：true-解析成功�?ID 匹配，false-数据长度不足�?ID 不匹�?
+**************************************************************************/
+static bool app_can_parse_order_data(uint8_t *data, uint8_t length, uint16_t slave_id, uint8_t *order_buf)
+{
+    if (length < 7 || ((data[1]<< 8) | data[2]) != slave_id) {
+				DBG_WARN("从机ID不匹配\r\n");
+        return false;
+    }
+    // 将二进制数据转换为字符串(数据是ASCII字符)
+    for (int i = 0; i < 4; i++) {
+				// 只处理可视ASCII字符 (32-126) �?x20 ~ 0x7E�?
+        if (data[i+3] >= 32 && data[i+3] <= 126) {
+            order_buf[i] = (char)data[i+3];
+        } else {
+            order_buf[i] = '?';
+        }
+    }
+    order_buf[4] = '\0';
+    DBG_INFO("收到从机发送的订单:%s\r\n",order_buf);
+    return true;
+}
+
+
+//---------------------------------------------------------------------------------------------------------------//
+//------------------------------------------------订单处理-------------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+/**************************************************************************
+Function: 开始主机订单处理计�?
+Input   : order_id - 订单ID
+Output  : �?
+函数功能：开始主机订单处理计�?
+入口参数：order_id - 订单ID
+返回  值：�?
+**************************************************************************/
+void app_can_Host_StartOrderProcessing(uint8_t *order_id)
+{
+    host_order_proc.is_processing = 1;
+    memcpy(host_order_proc.order_id, order_id, 4);
+    host_order_proc.start_time = getSysTickCnt();
+    host_order_proc.timeout_checked = 0;
+    
+    DBG_INFO("HOST_ORDER: Started processing order %.4s at time %lu\r\n", 
+           order_id, host_order_proc.start_time);
+}
+
+/**************************************************************************
+Function: 结束主机订单处理
+Input   : �?
+Output  : �?
+函数功能：结束主机订单处�?
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_EndOrderProcessing(void)
+{
+    if (host_order_proc.is_processing) {
+        uint32_t process_time = getSysTickCnt() - host_order_proc.start_time;
+        DBG_INFO("HOST_ORDER: Finished processing order %.4s, took %lu ms\r\n", 
+               host_order_proc.order_id, process_time);
+    }
+    
+    host_order_proc.is_processing = 0;
+    memset(host_order_proc.order_id, 0, sizeof(host_order_proc.order_id));
+    host_order_proc.start_time = 0;
+    host_order_proc.timeout_checked = 0;
+}
+
+
+/**************************************************************************
+Function: 检查主机订单处理超�?
+Input   : �?
+Output  : �?
+函数功能：检查主机订单处理是否超�?
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_CheckOrderTimeout(void)
+{
+    if (!host_order_proc.is_processing || host_order_proc.timeout_checked) {
+        return;
+    }
+    
+    uint32_t current_time = getSysTickCnt();
+    uint32_t elapsed_time = current_time - host_order_proc.start_time;
+    
+    if (elapsed_time > HOST_ORDER_PROCESS_TIMEOUT) {
+        DBG_ERROR("HOST_ORDER: Timeout! Order %.4s processing took %lu ms (> %d ms)\r\n", 
+               host_order_proc.order_id, elapsed_time, HOST_ORDER_PROCESS_TIMEOUT);
+        
+        // 生成超时事件
+        Host_response_event_t timeout_event;
+        timeout_event.Host_id = HOST_ID;
+        memcpy(timeout_event.order_id, host_order_proc.order_id, 4);
+        timeout_event.event_type = ORDER_EVENT_TIMEOUT;
+        timeout_event.channel_num = 0;
+        timeout_event.quantity = 0;
+        
+        // 发送到语音队列
+        if (xHostVoiceQueue != NULL) {
+            if (xQueueSend(xHostVoiceQueue, &timeout_event, 0) == pdTRUE) {
+                DBG_INFO("HOST_QUEUE: Timeout event sent to voice queue, order: %.4s\r\n", 
+                       host_order_proc.order_id);
+            } else {
+                DBG_WARN("HOST_QUEUE: Voice queue full, timeout event dropped\r\n");
+            }
+        }
+        
+        // 发送到显示队列
+        if (xHostDisplayQueue != NULL) {
+            if (xQueueSend(xHostDisplayQueue, &timeout_event, 0) == pdTRUE) {
+                DBG_INFO("HOST_QUEUE: Timeout event sent to display queue, order: %.4s\r\n", 
+                       host_order_proc.order_id);
+            } else {
+                DBG_WARN("HOST_QUEUE: Display queue full, timeout event dropped\r\n");
+            }
+        }
+        
+        
+        // 结束处理
+        app_can_Host_EndOrderProcessing();
+    }
+}
+
+/**************************************************************************
+Function: Send order acknowledgment to slave
+Input   : slave_id - target slave ID
+          order_id - order ID bytes
+Output  : can_status_t status
+函数功能：向从机发送订单确�?
+入口参数：slave_id - 目标从机ID
+          order_id - 订单ID字节
+返回  值：can_status_t状�?
+**************************************************************************/
+can_status_t app_can_Host_SendOrderAck(uint16_t slave_id, uint8_t *order_id)
+{
+    if (!IS_VALID_SLAVE_ID(slave_id)) {
+        return CAN_STATUS_INVALID_ID;
+    }
+    
+    // 准备确认数据 [命令�?1) | 从机ID(1) | 订单ID(4)]
+    uint8_t ack_data[7];
+    ack_data[0] = CMD_ORDER_ACK;  // 订单确认命令�?
+    ack_data[1] = (slave_id >> 8) & 0xFF;       // 从机ID高字�? 
+    ack_data[2] = slave_id & 0xFF;							// 低字�?
+    ack_data[3] = order_id[0];    // 订单ID字节1
+    ack_data[4] = order_id[1];    // 订单ID字节2
+    ack_data[5] = order_id[2];    // 订单ID字节3
+    ack_data[6] = order_id[3];    // 订单ID字节4
+    
+    // 发送到从机
+    can_status_t status = bsp_can_Transmit(slave_id, 7, ack_data);
+    
+		DBG_DEBUG("DEBUG_HOST: Sending to slave 0x%03X, data: ", slave_id);
+    for(int i = 0; i < 7; i++) {
+        DBG_DEBUG("%02X ", ack_data[i]);
+    }
+    DBG_DEBUG("\r\n");
+		
+    if (status == CAN_STATUS_OK) {
+        DBG_INFO("CAN_HOST: Order ACK sent to slave 0x%03X\r\n", slave_id);
+    } else {
+        DBG_ERROR("CAN_HOST: Failed to send order ACK to slave 0x%03X: %d\r\n", slave_id, status);
+    }
+    
+    return status;
+}
+
+
+/**************************************************************************
+Function: Add order request to queue
+Input   : device_id - device ID (host or slave)
+          order_id  - order ID (4 bytes)
+          request_type - 0: slave request, 1: host scan
+Output  : pdTRUE if success, pdFALSE if failed
+函数功能：添加订单请求到队列
+入口参数：device_id - 装置ID
+          order_id - 订单ID
+          request_type - 请求类型
+返回  值：pdTRUE-成功，pdFALSE-失败
+**************************************************************************/
+BaseType_t app_can_order_AddRequest(uint16_t device_id, uint8_t *order_id, uint8_t request_type)
+{
+    if (xOrderRequestQueue == NULL) {
+        DBG_ERROR("ORDER_QUEUE: Queue not initialized\r\n");
+        return pdFALSE;
+    }
+    
+    order_request_t new_request;
+    new_request.device_id = device_id;
+    memcpy(new_request.order_id, order_id, 4);
+    new_request.timestamp = getSysTickCnt();
+    new_request.request_type = request_type;
+    
+    // 尝试添加请求到队列（非阻塞方式）
+    BaseType_t result = xQueueSend(xOrderRequestQueue, &new_request, 0);
+    
+    if (result == pdTRUE) {
+        UBaseType_t queue_count = uxQueueMessagesWaiting(xOrderRequestQueue);
+        DBG_INFO("ORDER_QUEUE: Request added, device:0x%03X, order:%.4s, queue:%lu/%d\r\n", 
+               device_id, order_id, queue_count, ORDER_QUEUE_LENGTH);
+				// 如果是从机请求，立即发送主机确认收到信息命�?
+				if (request_type == 0 && IS_VALID_SLAVE_ID(device_id)) {
+						app_can_Host_SendOrderAck(device_id, order_id);
+				}
+    } else {
+        DBG_WARN("ORDER_QUEUE: Queue full! Cannot add request from device:0x%03X\r\n", device_id);
+    }
+    
+    return result;
+}
+
+
+/**************************************************************************
+Function: 主机直接处理扫码订单（无CAN传输�?
+Input   : order_id - 扫码得到的订单ID
+Output  : �?
+说明     : 直接从FlashDB查询订单信息，生成事件通知语音和显示模�?
+**************************************************************************/
+void app_can_process_host_order_request(uint8_t host_id, uint8_t *order_id)
+{
+    DBG_INFO("HOST_SCAN: Processing order %s directly from scan module\r\n", order_id);
+    
+		// 检查是否与当前处理的订单匹�?
+    if (host_order_proc.is_processing && memcmp(host_order_proc.order_id, order_id, 4) == 0) {
+        DBG_INFO("HOST_SCAN: Order %.4s is being processed, timeout check reset\r\n", order_id);
+    }
+	
+    // 初始化订单事件结构体
+    Host_response_event_t order_event;
+    uint16_t product_id; //产品ID
+    order_event.Host_id = host_id;           // 主机ID固定�?
+		memcpy(order_event.order_id, order_id, 4);
+	
+    // 在FlashDB中查询订单信息（查询order_id�?
+    order_t order = {0};
+
+    // 根据主控装置ID-->查询商品ID是否为空
+    if(FlashDB_LoadDeviceProduct(host_id, &product_id) == 0){
+        /**  ===== �?FlashDB 读取订单信息 =====  **/
+        if (FlashDB_LoadOrder((const char *)order_id, product_id, &order) == 0) {
+            // 订单存在-->判断是否已被取件
+            if(order.status == 0){
+                // 订单存在且未取件 --> 自动标记为已取件
+                order_event.event_type = ORDER_EVENT_VALID;
+                order_event.channel_num = order.product_id;   // 假设产品id为通道编号
+                order_event.quantity = order.quantity;
+                DBG_INFO("HOST_SCAN: Found order %s, qty=%d, status=%d\r\n",
+                    order.order_id, order.quantity, order.status);
+
+                // 更新FlashDB中的订单状�?由于是本机订单，无需等待回传，收到正确的订单ID认为已成功取�?
+                FlashDB_UpdateOrderStatus((const char *)order_id, product_id, 1);
+                DBG_INFO("HOST_SCAN: Order %s automatically marked as picked up\r\n", order_id);
+            }else{
+                // 订单存在但已取件 --> 修改状态退�?
+                order_event.event_type = ORDER_EVENT_ALREADY_PICKED;
+                DBG_INFO("HOST_SCAN: Order %s already picked\r\n", order_id);
+            }   
+        } else {
+            // 查询无此订单 --> 修改状态为订单无效
+            order_event.event_type = ORDER_EVENT_INVALID;
+            DBG_INFO("HOST_SCAN: Order %s is invalid\r\n", order_id);
+        }
+    }else{
+        // 查询商品ID为空 --> 装置未分配商品通道
+        order_event.event_type = ORDER_EVENT_DEVICE_NO_CHANNEL;
+        DBG_WARN("Host Device(%03X) not set channle!\r\n",host_id);
+    }
+
+	// 发送到主机语音队列
+    if (xHostVoiceQueue != NULL) {
+        if (xQueueSend(xHostVoiceQueue, &order_event, 0) == pdTRUE) {
+            DBG_INFO("HOST_QUEUE: Event sent to voice queue, type: %d, order: %s\r\n", 
+                   order_event.event_type, order_event.order_id);
+        } else {
+            DBG_WARN("HOST_QUEUE: Voice queue full, event dropped\r\n");
+        }
+    }
+    
+    // 发送到主机显示队列
+    if (xHostDisplayQueue != NULL) {
+        if (xQueueSend(xHostDisplayQueue, &order_event, 0) == pdTRUE) {
+            DBG_INFO("HOST_QUEUE: Event sent to display queue, type: %d, order: %s\r\n", 
+                   order_event.event_type, order_event.order_id);
+        } else {
+            DBG_WARN("HOST_QUEUE: Display queue full, event dropped\r\n");
+        }
+    }
+		
+	// 处理完成，结束计�?
+    app_can_Host_EndOrderProcessing();
+    
+    DBG_INFO("HOST_SCAN: Order %s processing completed, event type: %d\r\n", 
+           order_id, order_event.event_type);
+}
+
+
+/**************************************************************************
+Function: app_can_process_slave_order_request
+Input   : slave_id, order_id
+Output  : none
+函数功能：处理从机订单查询请求。校验订单是否存在、是否已取、所属通道及数量，并回�?CAN 响应
+入口参数：slave_id-来源从机 ID�?
+					order_id-指向待校验订单字符串的指�?
+返回  值：�?
+**************************************************************************/
+static void app_can_process_slave_order_request(uint16_t slave_id, uint8_t *order_id)
+{
+    DBG_INFO("CAN_PROC: Order request from slave %03X, order:%s\r\n", slave_id, order_id);
+
+    //订单是否存在、订单状态（�?未取）、通道编号、餐品数�?
+    uint8_t order_exists = 0;
+    uint8_t	order_status = 0;
+    uint8_t response_channel = 0;
+    uint8_t quantity = 0;
+
+    uint16_t slave_product_id; //产品ID
+    // 在FlashDB中查询订单信息（查询order_id�?
+    order_t order;
+    // 查询装置对应的商品ID
+    if(FlashDB_LoadDeviceProduct(slave_id, &slave_product_id) == 0){
+        // 订单ID + 商品ID 查询订单
+        if (FlashDB_LoadOrder((const char *)order_id, slave_product_id, &order) == 0) {
+            order_status = order.status;
+            quantity = order.quantity;
+            response_channel = order.product_id; //暂定通道编号为产品id
+            order_exists = 1; //订单存在
+					  FlashDB_UpdateOrderStatus((const char *)order_id,slave_product_id,1);
+        }else{
+            // 订单无效或者取件通道错误，核对取件地点、时间、通道�?
+            /*************************************************/
+            order_exists = 0;
+            order_status = 0;
+            response_channel = 0;
+            quantity = 0;
+        }
+        if (!order_status) {
+            DBG_INFO("CAN_PROC: From Slave: %03X\r\n Order %s found, channel: %d, quantity: %d, marked as picked up.\r\n", 
+                                slave_id, order_id, response_channel, quantity);
+        }else{
+                DBG_INFO("Sorry! This order(%s) has been picked!\r\n", order_id);
+        }					
+    }else{
+        // 该从机装置未分配商品通道
+        order_exists = 0; 
+        order_status = 0;
+        quantity = 0;
+        response_channel = CHANNEL_INVALID;
+        DBG_WARN("CAN_PROC: Slave: %03X not set channle!\r\n", slave_id);
+    }
+    
+    // 直接构建响应数据并发�?
+    uint8_t response_data[8] = {0};
+    
+    response_data[0] = (slave_id >> 8) & 0xFF;     // 目标从机ID 高字�?
+		response_data[1] = slave_id & 0xFF;			   		 // 低字�?
+    response_data[2] = order_exists;               // 订单是否存在
+    response_data[3] = response_channel;           // 通道编号
+    response_data[4] = order_status;               // 取件状�?
+    response_data[5] = quantity;                   // 数量
+    
+    if (app_can_Host_SendCmd(slave_id, RESP_TX, response_data, 6) == CAN_STATUS_OK) {
+        DBG_INFO("CAN_SEND: Order response sent to slave %03X, order: %s, exists: %d\r\n", 
+               slave_id, order_id, order_exists);
+    } else {
+        DBG_ERROR("CAN_SEND: Failed to send order response to slave %d\r\n", slave_id);
+    }
+}
+
+
+/**************************************************************************
+Function: 主机处理扫码订单请求，存入消息队�?
+Input   : order_id - 扫码得到的订单ID
+Output  : �?
+说明     : 将主机扫码订单添加到处理队列
+**************************************************************************/
+void app_can_process_host_scan_order(uint8_t *order_id)
+{
+    DBG_INFO("HOST_SCAN: Processing order %s from host scanner\r\n", order_id);
+    
+    // 将订单ID转换�?字节数组
+    uint8_t order_bytes[4];
+		memcpy(order_bytes, order_id, 4);
+    
+		// 开始处理计�?
+    app_can_Host_StartOrderProcessing(order_bytes);
+	
+    // 添加到订单请求队�?
+    if (app_can_order_AddRequest(HOST_ID, order_bytes, 1) == pdTRUE) {
+        DBG_INFO("HOST_SCAN: Host scan order queued successfully\r\n");
+    } else {
+        DBG_WARN("HOST_SCAN: Failed to queue host scan order\r\n");
+    }
+}
+
+
+//---------------------------------------------------------------------------------------------------------------//
+//------------------------------------------------总接收处�?----------------------------------------------------//
+//---------------------------------------------------------------------------------------------------------------//
+
+
+/**************************************************************************
+Function: Application CAN host receive handler
+Input   : none
+Output  : none
+函数功能：应用层CAN主机接收处理函数
+入口参数：无
+返回  值：�?
+**************************************************************************/
+void app_can_Host_ProcessReceive(void)
+{
+    if (!bsp_can_ReceiveFlag()) return;
+
+    uint32_t recv_id;
+    uint8_t recv_data[8];
+    uint8_t recv_len;
+		uint8_t order_id[5];
+
+    if (bsp_can_Receive(&recv_id, &recv_len, recv_data)!= CAN_STATUS_OK || recv_len == 0 || recv_len >8 ) return;
+	
+    // 提取命令码并处理
+    if (recv_len > 0) {
+        uint8_t cmd = recv_data[0];
+
+
+    // 处理从机响应	
+    if (IS_SLAVE_RESPONSE_ID(recv_id)) {
+			// 原数据（0x1001-0x17FF --> 提取从机编号�?01-7FF�?
+			uint16_t slave_id = GET_SLAVE_ID_FROM_RESPONSE(recv_id);		
+			if (IS_VALID_SLAVE_ID(slave_id)) {
+					// 更新从机状�?
+					slave_status[slave_id-1].is_online = 1;
+					slave_status[slave_id-1].last_comm_time = xTaskGetTickCount();
+					
+					switch(cmd) {
+						
+							// 处理从机ping请求
+							case CMD_SELF_TEST: 									 
+								app_can_Host_ProcessSlavePing(slave_id, recv_data, recv_len);
+								break;		
+							
+								// 处理从机ping成功确认
+							case PING_SUCCESS:
+								app_can_Host_ProcessPingSuccess(slave_id, recv_data, recv_len);	
+								break;
+							
+							// 对正常通信命令的响�?
+							case CMD_TX:  
+								if (app_can_parse_order_data(recv_data, recv_len, slave_id, order_id)) {									  
+										
+										// 不直接处理，而是添加到消息队�?
+										uint8_t order_bytes[4];
+										memcpy(order_bytes, order_id, 4);
+										
+										if (app_can_order_AddRequest(slave_id, order_bytes, 0) == pdTRUE) {
+												DBG_INFO("HOST: Order request from slave %03X queued, order: %s\r\n", slave_id, order_id);
+										} else {
+												DBG_WARN("HOST: Failed to queue order request from slave %d\r\n", slave_id);
+										}
+								}
+								break;
+								
+
+							// 从机回传的取件成功响�?				
+							case CMD_PICK_OK:
+								if (recv_len == 5 && ((recv_data[1] << 8) | recv_data[2] )== slave_id) 
+								{
+                                    // 已经取件的订单编�?
+                                    uint8_t pickup_order_id[4] = {0};
+                                    uint16_t product_id;
+                                    for(int i = 0; i < 4; i++)
+                                        pickup_order_id[i] = recv_data[i+3];
+                                        // 读取product_id成功 更改取件状�?
+                                        if(FlashDB_LoadDeviceProduct(slave_id, &product_id) == 0){
+                                            // 更新数据库内订单的取件状态（把pickup_order_id订单更改为已取）
+                                            FlashDB_UpdateOrderStatus((const char *)pickup_order_id, product_id, 1);
+                                            DBG_INFO("Order-%s has been picked up!\r\n",pickup_order_id);
+                                        }else{
+                                                DBG_WARN("订单< %s >已被取件，但获取产品ID失败\r\n",pickup_order_id);
+                                        }
+
+								}
+								break;
+								
+							default:
+								DBG_WARN("HOST: Unknown command 0x%02X from slave %d\r\n", recv_data[0], slave_id);
+								break;
+					}
+				
+					DBG_DEBUG("HOST: From slave 0x%03X: ", slave_id);
+					for (int i = 0; i < recv_len; i++) {
+							DBG_DEBUG("%02X ", recv_data[i]);
+					}
+					DBG_DEBUG("\r\n");
+			}
+		}
+}
+}
+
+//---------------------------------------------------------------------------------------------------------------//
+//--------------------------------------------------CAN任务------------------------------------------------------//
+//--------------------------------------------------    -------------------------------------------------------------//
+
+
+void can_task(void *pvParameters)
+{
+    // 等待 FlashDB 和 4G 业务就绪（替代原来 OK_4G_flag 轮询）
+    DBG_INFO("CAN任务启动，等待FlashDB就绪...
+");
+    xEventGroupWaitBits(xStartupEventGroup, BIT_FLASHDB_READY,
+    DBG_INFO("CAN任务启动，等待4G业务就绪...
+    DBG_INFO("CAN任务启动，等待4G业务就绪...
+");
+    xEventGroupWaitBits(xStartupEventGroup, BIT_4G_BUSINESS_READY,
+    DBG_INFO("can模块就绪，开始CAN通信
+    DBG_INFO("can模块就绪，开始CAN通信
+");
+		
+    // CAN初始化（主机�?
+    app_can_Host_Init();
+
+    // 在主机启动时4G模块收到数据后调用
+    uint16_t allowed_slaves[] = {0};
+		DBG_INFO("从机列表:");
+		//从4G模块读取装置列表
+		uint8_t allowed_cnt = DeviceMgr_Export(allowed_slaves,MAX_SLAVE_COUNT);
+		for(int i = 0; i < allowed_cnt; i++)
+			DBG_INFO("%03x ",allowed_slaves[i]);
+		DBG_INFO("\n");
+    app_can_Host_InitSlaveIDList(allowed_slaves, allowed_cnt);
+
+	  u32 lastWakeTime = getSysTickCnt();
+		
+		
+		// 接受订单处理消息队列
+		order_request_t current_request;
+    uint8_t order_id_str[5] = {0};
+		
+    // 接受扫码消息队列结构�?
+    scan_event_t can_event;
+
+    while(1)
+    {
+    	vTaskDelayUntil(&lastWakeTime, F2T(RATE_10_HZ)); //10ms执行一�?	
+			
+			/* 处理can接收 */
+			app_can_Host_ProcessReceive();
+			
+			// 处理CAN队列中的扫码事件
+			if (xCanQueue != NULL) {
+					if (xQueueReceive(xCanQueue, &can_event, 0) == pdTRUE) {
+							if (can_event.data_ready  && can_event.is_valid_order ) {
+								// 主机将本身扫描器得到的订单id加入消息队列
+								app_can_process_host_scan_order(can_event.qr_data);
+							}
+					}
+			}
+			
+		// 处理连接超时管理（每100ms检查一次）
+       static uint32_t last_conn_check = 0;
+       if (getSysTickCnt() - last_conn_check > 100) {
+					app_can_Host_ConnectionTimeoutManager();
+					last_conn_check = getSysTickCnt();
+       }
+			 
+		// 检查主机订单处理超时（100ms检查一次）
+        static uint32_t last_timeout_check = 0;
+        if (getSysTickCnt() - last_timeout_check > 100) {
+            app_can_Host_CheckOrderTimeout();
+            last_timeout_check = getSysTickCnt();
+        }
+			
+        // 等待订单请求（非阻塞方式�?
+        if (xQueueReceive(xOrderRequestQueue, &current_request, 0) == pdTRUE) {
+            // 处理当前请求(后续不使用order_id_str 这个数组输出会一乱码)
+            memcpy(order_id_str, current_request.order_id, 4);
+            order_id_str[4] = '\0';
+            
+            uint32_t wait_time = getSysTickCnt() - current_request.timestamp;
+            DBG_INFO("ORDER_TASK: Processing request - device:0x%03X, order:%s, waited:%lums, queue:%lu\r\n", 
+                            current_request.device_id,  order_id_str, wait_time, 
+                            uxQueueMessagesWaiting(xOrderRequestQueue));
+            
+            // 根据设备类型处理请求
+            if (current_request.device_id == HOST_ID) {
+                    // 主机扫码订单
+                    app_can_process_host_order_request(current_request.device_id, order_id_str);
+            } else {
+                    // 从机订单请求
+                    app_can_process_slave_order_request(current_request.device_id, order_id_str);
+            }
+        }
+			
+		}
+}		
